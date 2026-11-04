@@ -257,7 +257,7 @@ jobs:
       - &app
         id: app
         if: env.HAS_APP == 'true'
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ secrets.ORBIS_APP_CLIENT_ID }}
           private-key: ${{ secrets.ORBIS_APP_PRIVATE_KEY }}
@@ -269,7 +269,7 @@ jobs:
           SLUG: ${{ steps.app.outputs.app-slug }}
         run: |
           id=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API_URL/users/$SLUG%5Bbot%5D" | jq -r .id)
-          { echo "name=$SLUG[bot]"; echo "id=$id"; } >> "$GITHUB_OUTPUT"
+          { echo "name=${SLUG}[bot]"; echo "id=$id"; } >> "$GITHUB_OUTPUT"
       - id: agent
         name: Run Orbis
         uses: anthropics/claude-code-action@v1
