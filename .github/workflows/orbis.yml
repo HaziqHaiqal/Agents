@@ -1,0 +1,403 @@
+name: Orbis
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: Live address of the app, if it has one
+        type: string
+        default: ""
+      setup:
+        description: Commands that prepare the project so its checks can run. Empty installs from the lockfile.
+        type: string
+        default: ""
+      node-version:
+        type: string
+        default: "24"
+      production-environment:
+        description: Deployment environment that counts as production
+        type: string
+        default: Production
+      reviewer:
+        description: GitHub user who reviews Orbis's PRs. Empty means the repo owner.
+        type: string
+        default: ""
+      tools:
+        description: Commands Orbis may run, in Claude Code's allowed-tools format
+        type: string
+        default: Bash(pnpm:*),Bash(npm run:*),Bash(npm test:*),Bash(npm ci:*),Bash(npm install:*),Bash(yarn:*)
+      model:
+        type: string
+        default: claude-sonnet-5-5
+      max-open-prs:
+        description: The weekly check-up skips while this many Orbis PRs wait for review
+        type: number
+        default: 2
+      max-incidents-per-day:
+        type: number
+        default: 5
+      workflow-file:
+        description: File name of the workflow in your repo that calls this one
+        type: string
+        default: orbis.yml
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+env:
+  ORBIS_RULES: |
+    You are Orbis, an agent that looks after this repository for its owner.
+    - Read CLAUDE.md first if it exists and follow it. If there isn't one, work out the project's checks from its files (package.json scripts, Makefile, README).
+    - Work on a new branch named orbis/<topic>. Never push to the default branch, merge anything, or close the owner's PRs.
+    - One topic per PR, small enough to review on a phone. Write PRs for the owner, not for an engineer: plain words, short.
+    - When fixing a bug, first write a test that fails because of it, then fix the code until the test passes.
+    - Run the project's checks (lint, types, formatting, tests, build) before opening a PR and fix what they report.
+    - Don't change how the app looks or add features. The owner decides those.
+    - Never edit .github/, secrets, hosting or database settings, or production data. If one of those is the cause, explain it in a comment instead.
+    - The repository may be public. Never copy personal data (names, emails, phone or account numbers, links that open private records) into issues, PRs, commits or logs.
+  TELL: |
+    tell() {
+      [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || return 0
+      jq -n --arg chat "$TELEGRAM_CHAT_ID" --arg text "$1" --arg label "$2" --arg url "$3" \
+        '{chat_id: $chat, text: $text, disable_web_page_preview: true}
+         + (if $url == "" then {} else {reply_markup: {inline_keyboard: [[{text: $label, url: $url}]]}} end)' |
+        curl -fsS -o /dev/null -H "Content-Type: application/json" -d @- \
+          "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" ||
+        echo "::warning::The Telegram message could not be sent."
+    }
+
+jobs:
+  alarm:
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+       github.event.workflow_run.conclusion == 'failure') ||
+      (github.event_name == 'deployment_status' && github.event.deployment.environment == inputs.production-environment &&
+       contains(fromJSON('["failure","error"]'), github.event.deployment_status.state))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ inputs.workflow-file }}
+          TITLE: >-
+            ${{ github.event_name == 'workflow_run' && format('{0} failed on {1}', github.event.workflow_run.name, github.event.workflow_run.head_branch) || 'Production deploy failed' }}
+          DETAILS: >-
+            ${{ github.event_name == 'workflow_run' && format('{0} failed for commit {1}. Run: {2}', github.event.workflow_run.name, github.event.workflow_run.head_sha, github.event.workflow_run.html_url) || format('The production deploy failed for commit {0}. The site still runs the previous version. Deploy log (needs the owner to sign in): {1}', github.event.deployment.sha, github.event.deployment_status.target_url) }}
+        run: gh workflow run "$WORKFLOW" -f title="$TITLE" -f details="$DETAILS"
+
+  triage:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.title != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: orbis-triage
+    permissions:
+      issues: write
+    outputs:
+      issue: ${{ steps.issue.outputs.number }}
+    steps:
+      - id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ github.event.inputs.title }}
+          DETAILS: ${{ github.event.inputs.details }}
+          LIMIT: ${{ inputs.max-incidents-per-day }}
+          HAS_AI: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          eval "$TELL"
+          gh label create orbis --color 5319E7 --description "Opened by Orbis" --force
+          gh label create incident --color B60205 --description "Site, deploy, API or CI problem" --force
+          open=$(gh issue list --label incident --state open --json title --jq '.[].title')
+          if grep -Fxq -- "$TITLE" <<<"$open"; then
+            echo "An open incident issue already covers \"$TITLE\", so nothing new starts." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          recent=$(gh issue list --state all --search "label:incident created:>=$since" --json number --jq length)
+          start=false
+          if [ "$HAS_AI" != true ]; then
+            note="No AI key is set up for Orbis in this repo, so it won't write a fix."
+          elif [ "$recent" -ge "$LIMIT" ]; then
+            note="Orbis has already looked at $LIMIT incidents in the last 24 hours, so it won't start on its own. Comment \"@orbis look into this\" to start it."
+          else
+            note="Orbis is on it and will comment here or open a fix PR."
+            start=true
+          fi
+          url=$(gh issue create --label incident --title "$TITLE" --body "$(printf '%s\n\n%s' "$DETAILS" "$note")")
+          if [ "$start" = true ]; then echo "number=${url##*/}" >> "$GITHUB_OUTPUT"; fi
+          tell "$(printf '🔴 %s: %s\n\n%s\n\n%s' "${GITHUB_REPOSITORY#*/}" "$TITLE" "${DETAILS:0:1500}" "$note")" "Open issue" "$url"
+
+  investigate:
+    needs: triage
+    if: needs.triage.outputs.issue != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - if: hashFiles('pnpm-lock.yaml') != ''
+        uses: pnpm/action-setup@v6
+      - if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+      - env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          if [ -n "$SETUP" ]; then bash -ec "$SETUP"
+          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          fi
+      - id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_bots: github-actions
+          additional_permissions: |
+            actions: read
+          prompt: |
+            ${{ env.ORBIS_RULES }}
+            The app is live at ${{ inputs.site || 'no address given' }}.
+
+            Incident issue #${{ needs.triage.outputs.issue }}: ${{ github.event.inputs.title }}
+            Read it with `gh issue view ${{ needs.triage.outputs.issue }}`. This is urgent: find the cause, fix it, test it and open a PR in this run.
+
+            1. Find the cause:
+               - A workflow failed: read the failed jobs with `gh run view <run id> --log-failed`, then run the same command here.
+               - A production deploy failed: run the project's build. If it builds here, the cause is in the hosting settings.
+               - An API error: find the code from the route and stack frames in the issue, then write a test that fails the same way.
+               - The site is down: check the site with curl and look at the commits on the default branch from the last day.
+               A test that fails only sometimes is flaky: say so rather than changing app code to hide it.
+            2. If the cause is in the code: write or update a test that fails because of the bug, fix the code until it passes and run the checks.
+               Commit on a branch named `orbis/fix-<topic>`, push it, and run
+               `gh pr create --label orbis --label incident --reviewer ${{ inputs.reviewer || github.repository_owner }}` with a title starting with "Fix:" and a short body:
+               What broke, Since when (commit), What changed, How it was tested, and the line "Closes #${{ needs.triage.outputs.issue }}".
+            3. If the cause is outside the code, change nothing. Comment on #${{ needs.triage.outputs.issue }} with what you found and exactly what the owner should do.
+
+            Finish with outcome "pr" (and pr_url) if you opened a PR, otherwise "comment", and a summary of one or two plain sentences for the owner.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns 50
+            --allowedTools "Edit,Write,${{ inputs.tools }},Bash(git:*),Bash(curl:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr create:*),Bash(gh issue view:*),Bash(gh issue comment:*)"
+            --disallowedTools "Edit(.github/**),Write(.github/**)"
+            --json-schema '{"type":"object","properties":{"outcome":{"type":"string","enum":["pr","comment"]},"summary":{"type":"string"},"pr_url":{"type":"string"}},"required":["outcome","summary"]}'
+      - if: always()
+        env:
+          OUT: ${{ steps.claude.outputs.structured_output }}
+          TITLE: ${{ github.event.inputs.title }}
+          ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ needs.triage.outputs.issue }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          eval "$TELL"
+          repo=${GITHUB_REPOSITORY#*/}
+          [ -n "$OUT" ] || OUT='{}'
+          outcome=$(jq -r '.outcome // empty' <<<"$OUT" 2>/dev/null || true)
+          summary=$(jq -r '.summary // empty' <<<"$OUT" 2>/dev/null || true)
+          pr=$(jq -r '.pr_url // empty' <<<"$OUT" 2>/dev/null || true)
+          if [ "$outcome" = pr ] && [ -n "$pr" ]; then
+            tell "$(printf '🛠 Fix ready · %s\n%s\n\n%s' "$repo" "$TITLE" "$summary")" "Open PR" "$pr"
+          elif [ -n "$outcome" ]; then
+            tell "$(printf '🔎 %s · %s\n\n%s' "$repo" "$TITLE" "$summary")" "Open issue" "$ISSUE_URL"
+          else
+            tell "$(printf '⚠️ %s · Orbis could not finish looking into: %s' "$repo" "$TITLE")" "Open run" "$RUN_URL"
+          fi
+
+  checkup-gate:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.title == '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      issues: write
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LIMIT: ${{ inputs.max-open-prs }}
+          HAS_AI: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          gh label create orbis --color 5319E7 --description "Opened by Orbis" --force
+          waiting=$(gh pr list --label orbis --state open --json number --jq length)
+          if [ "$HAS_AI" != true ]; then
+            echo "reason=Skipped: no AI key is set up for Orbis in this repo." >> "$GITHUB_OUTPUT"
+          elif [ "$waiting" -ge "$LIMIT" ]; then
+            echo "reason=Skipped: $waiting Orbis PRs are already waiting for you." >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  checkup:
+    needs: checkup-gate
+    if: needs.checkup-gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    outputs:
+      result: ${{ steps.claude.outputs.structured_output }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - if: hashFiles('pnpm-lock.yaml') != ''
+        uses: pnpm/action-setup@v6
+      - if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+      - env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          if [ -n "$SETUP" ]; then bash -ec "$SETUP"
+          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          fi
+      - id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            ${{ env.ORBIS_RULES }}
+            This is the weekly check-up. Find the single most useful fix or clean-up and open one small PR for it, or change nothing.
+
+            1. Run `gh pr list --label orbis --state closed --limit 30 --json number,title,mergedAt` and read each unmerged one with `gh pr view <number> --comments`. The owner rejected those. Don't propose them or anything close again.
+            2. Run `gh pr list --state open` so you don't repeat open work, including Dependabot's.
+            3. Look in this order and stop at the first real finding:
+               a. Security: known vulnerable packages, personal data reaching logs or the browser, server code trusting input it shouldn't.
+               b. Bugs: wrong calculations, edge cases that break, text missing from one language.
+               c. Upkeep: docs or guides that no longer match the app, recent changes without tests.
+               d. Clean-up: unused packages, files or exports.
+               e. Small speed or accessibility wins that don't change the look.
+               Only count something you can prove from the code or a failing test. A hunch is not a finding.
+            4. Make the change and run the checks until they pass.
+            5. Commit on a branch named `orbis/<topic>`, push it, then run
+               `gh pr create --label orbis --reviewer ${{ inputs.reviewer || github.repository_owner }}` with a plain title and a short body with these headings:
+               What's wrong, What changed, Risk, How to check.
+
+            Finish with outcome "pr" (and pr_url) or "nothing", and a summary of one plain sentence for the owner's weekly report.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns 60
+            --allowedTools "Edit,Write,${{ inputs.tools }},Bash(git:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr create:*),Bash(gh issue list:*),Bash(gh issue view:*)"
+            --disallowedTools "Edit(.github/**),Write(.github/**)"
+            --json-schema '{"type":"object","properties":{"outcome":{"type":"string","enum":["pr","nothing"]},"summary":{"type":"string"},"pr_url":{"type":"string"}},"required":["outcome","summary"]}'
+
+  weekly-report:
+    needs: [checkup-gate, checkup]
+    if: always() && needs.checkup-gate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      issues: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REASON: ${{ needs.checkup-gate.outputs.reason }}
+          CHECKUP: ${{ needs.checkup.result }}
+          OUT: ${{ needs.checkup.outputs.result }}
+          PULLS_URL: ${{ github.server_url }}/${{ github.repository }}/pulls
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          eval "$TELL"
+          since=$(date -u -d '7 days ago' +%Y-%m-%d)
+          outages=$(gh issue list --state all --search "label:incident \"Site down\" in:title created:>=$since" --json number --jq length)
+          incidents=$(gh issue list --state all --search "label:incident created:>=$since" --json number --jq length)
+          merged=$(gh pr list --state merged --search "label:orbis merged:>=$since" --json number --jq length)
+          waiting=$(gh pr list --state open --json number --jq length)
+          [ -n "$OUT" ] || OUT='{}'
+          summary=$(jq -r '.summary // empty' <<<"$OUT" 2>/dev/null || true)
+          pr=$(jq -r '.pr_url // empty' <<<"$OUT" 2>/dev/null || true)
+          if [ -n "$REASON" ]; then line=$REASON
+          elif [ -n "$summary" ]; then line=$summary
+          elif [ "$CHECKUP" = failure ]; then line="The check-up run failed. Open the run on GitHub to see why."
+          else line="Nothing to report."
+          fi
+          text=$(printf '📋 Orbis weekly · %s\n\nOutages: %s · Incidents: %s\nOrbis fixes merged: %s\nPRs waiting for you: %s\n\nCheck-up: %s' \
+            "${GITHUB_REPOSITORY#*/}" "$outages" "$incidents" "$merged" "$waiting" "$line")
+          echo "$text" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$pr" ]; then tell "$text" "Open PR" "$pr"; else tell "$text" "Open PRs" "$PULLS_URL"; fi
+
+  respond:
+    if: >-
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@orbis')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@orbis')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@orbis')) ||
+      (github.event_name == 'issues' && github.event.action == 'opened' && contains(github.event.issue.body, '@orbis'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - if: hashFiles('pnpm-lock.yaml') != ''
+        uses: pnpm/action-setup@v6
+      - if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+      - env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          if [ -n "$SETUP" ]; then bash -ec "$SETUP"
+          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          fi
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "@orbis"
+          include_comments_by_actor: ${{ inputs.reviewer || github.repository_owner }},claude[bot]
+          additional_permissions: |
+            actions: read
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns 40
+            --append-system-prompt "${{ env.ORBIS_RULES }}"
+            --allowedTools "Edit,Write,${{ inputs.tools }},Bash(git:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Bash(gh run view:*),Bash(gh issue view:*)"
+            --disallowedTools "Edit(.github/**),Write(.github/**)"

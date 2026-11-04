@@ -1,0 +1,166 @@
+name: Orbis health
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: Live address of the app
+        type: string
+        required: true
+      paths:
+        description: Pages to check, separated by spaces. A page is down when it answers with a server error or not at all.
+        type: string
+        default: /
+      rollback-max-age-minutes:
+        description: Roll back on Vercel only when the live version is younger than this
+        type: number
+        default: 120
+      workflow-file:
+        description: File name of the Orbis workflow in your repo
+        type: string
+        default: orbis.yml
+    secrets:
+      VERCEL_TOKEN:
+        required: false
+      VERCEL_ORG_ID:
+        required: false
+      VERCEL_PROJECT_ID:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+env:
+  TELL: |
+    tell() {
+      [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || return 0
+      jq -n --arg chat "$TELEGRAM_CHAT_ID" --arg text "$1" --arg label "$2" --arg url "$3" \
+        '{chat_id: $chat, text: $text, disable_web_page_preview: true}
+         + (if $url == "" then {} else {reply_markup: {inline_keyboard: [[{text: $label, url: $url}]]}} end)' |
+        curl -fsS -o /dev/null -H "Content-Type: application/json" -d @- \
+          "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" ||
+        echo "::warning::The Telegram message could not be sent."
+    }
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: orbis-health
+    permissions:
+      issues: write
+      actions: write
+    env:
+      SITE: ${{ inputs.site }}
+      PATHS: ${{ inputs.paths }}
+      REHEARSE: ${{ github.event.inputs.rehearse == 'true' }}
+      CAN_ROLL_BACK: ${{ secrets.VERCEL_TOKEN != '' }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - id: probe
+        run: |
+          down() { [ "$1" = 000 ] || [ "$1" -ge 500 ]; }
+          for attempt in 1 2 3; do
+            failed=false
+            answers=()
+            for path in $PATHS; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${SITE%/}$path" || true)
+              answers+=("$path answered $code")
+              if down "$code"; then failed=true; fi
+            done
+            if [ "$failed" = false ]; then break; fi
+            if [ "$attempt" -lt 3 ]; then sleep 60; fi
+          done
+          detail=$(IFS=,; echo "${answers[*]}")
+          echo "detail=${detail//,/, }." >> "$GITHUB_OUTPUT"
+          if [ "$REHEARSE" = true ] || [ "$failed" = true ]; then echo "down=true" >> "$GITHUB_OUTPUT"; fi
+
+      - id: open
+        run: |
+          found=$(gh issue list --label incident --state open --json number,title,createdAt,body \
+            --jq '[.[] | select(.title == "Site down")][0] // empty | "\(.number) \(.createdAt) \(.body | test("Rolled back"))"')
+          if [ -n "$found" ]; then
+            read -r number created rolled <<<"$found"
+            { echo "number=$number"; echo "created=$created"; echo "rolled=$rolled"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: rollback
+        if: >-
+          steps.probe.outputs.down == 'true' && env.CAN_ROLL_BACK == 'true' &&
+          (steps.open.outputs.number == '' || env.REHEARSE == 'true')
+        continue-on-error: true
+        env:
+          MAX_AGE: ${{ inputs.rollback-max-age-minutes }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com$1"; }
+          case "$VERCEL_ORG_ID" in team_*) team="teamId=$VERCEL_ORG_ID" ;; *) team="" ;; esac
+          host=${SITE#*://}
+          live=$(api "/v4/aliases/${host%%/*}?$team" | jq -r '.deploymentId // empty')
+          list=$(api "/v6/deployments?projectId=$VERCEL_PROJECT_ID&target=production&state=READY&limit=20&$team")
+          created=$(jq -r --arg id "$live" '.deployments[] | select(.uid == $id) | .created' <<<"$list")
+          previous=$(jq -r --arg id "$live" --argjson before "${created:-0}" \
+            '[.deployments[] | select(.uid != $id and .created < $before)] | max_by(.created) | .url // empty' <<<"$list")
+          if [ -z "$created" ] || [ -z "$previous" ]; then
+            result="No automatic rollback: Vercel didn't show the live version and the one before it."
+          else
+            minutes=$(( ($(date +%s) * 1000 - created) / 60000 ))
+            if [ "$minutes" -gt "$MAX_AGE" ]; then
+              result="No automatic rollback: the live version is $minutes minutes old, so a new release is unlikely to be the cause."
+            elif [ "$REHEARSE" = true ]; then
+              result="Rehearsal only: this would roll back to https://$previous, because the live version is $minutes minutes old."
+            else
+              npx --yes vercel@65.11.0 rollback "https://$previous" --token "$VERCEL_TOKEN" --timeout 3m
+              result="Rolled back to the previous version (https://$previous), because the live version was only $minutes minutes old. New releases stay paused until you press Undo Rollback in Vercel."
+            fi
+          fi
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+
+      - name: Report the outage
+        if: steps.probe.outputs.down == 'true' && (steps.open.outputs.number == '' || env.REHEARSE == 'true')
+        env:
+          DETAIL: ${{ steps.probe.outputs.detail }}
+          ROLLBACK: ${{ steps.rollback.outputs.result }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ inputs.workflow-file }}
+        run: |
+          eval "$TELL"
+          if [ "$ROLLBACK_OUTCOME" = failure ]; then
+            rollback="The automatic rollback failed (see $RUN_URL). Roll back in Vercel by hand if the site is still down."
+          elif [ -n "$ROLLBACK" ]; then
+            rollback=$ROLLBACK
+          else
+            rollback="Automatic rollback is off until the VERCEL_TOKEN, VERCEL_ORG_ID and VERCEL_PROJECT_ID secrets are added."
+          fi
+          details=$(printf 'The health check could not reach %s at %s UTC. %s\n\n%s' "$SITE" "$(date -u '+%d %b %H:%M')" "$DETAIL" "$rollback")
+          if [ "$REHEARSE" = true ]; then
+            echo "$details" >> "$GITHUB_STEP_SUMMARY"
+            tell "$(printf '🧪 Rehearsal · %s\nNothing was changed. This is what Orbis would do if the site went down:\n\n%s' "${GITHUB_REPOSITORY#*/}" "$details")" "Open run" "$RUN_URL"
+          else
+            gh workflow run "$WORKFLOW" -f title="Site down" -f details="$details"
+          fi
+
+      - name: Report recovery
+        if: steps.probe.outputs.down != 'true' && steps.open.outputs.number != ''
+        env:
+          NUMBER: ${{ steps.open.outputs.number }}
+          CREATED: ${{ steps.open.outputs.created }}
+          ROLLED: ${{ steps.open.outputs.rolled }}
+          ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ steps.open.outputs.number }}
+        run: |
+          eval "$TELL"
+          minutes=$(( ($(date +%s) - $(date -d "$CREATED" +%s)) / 60 ))
+          note="Back up at $(date -u '+%d %b %H:%M') UTC, about $minutes minutes after this issue was opened."
+          if [ "$ROLLED" = true ]; then
+            note="$note Orbis rolled back to the previous version, so new releases stay paused. Press Undo Rollback in Vercel once the fix is merged."
+          fi
+          gh issue close "$NUMBER" --comment "$note"
+          tell "$(printf '✅ %s is back up\n\n%s' "${GITHUB_REPOSITORY#*/}" "$note")" "Open issue" "$ISSUE_URL"
