@@ -183,7 +183,7 @@ jobs:
         uses: actions/setup-python@v7
       - &uv
         if: hashFiles('uv.lock') != ''
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.3
       - &go
         if: hashFiles('go.mod') != ''
         uses: actions/setup-go@v7

@@ -131,4 +131,4 @@ curl -X POST https://api.github.com/repos/OWNER/REPO/actions/workflows/orbis.yml
 
 ## Versions
 
-Projects use `@orbis-v2`. Changes that could break existing projects get a new label (`orbis-v3`), and each project moves when its owner is ready.
+Projects use `@orbis-v3`. Changes that could break existing projects get a new label (`orbis-v4`), and each project moves when its owner is ready.
