@@ -1,6 +1,6 @@
 # Agents
 
-AI agents that look after projects. Each one is a shared GitHub workflow: a project adds a couple of small files, and the agent runs on GitHub's computers, so it works even when nobody's computer is on.
+AI agents that look after projects. Each one is a shared GitHub workflow: a project adds a couple of small files, and the agent runs on GitHub's computers, so it works even when nobody's computer is on. They work with most languages and hosts, and with the AI service you choose.
 
 | Agent                    | What it does                                                                                                                                                                                                  |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

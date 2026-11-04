@@ -7,13 +7,22 @@ on:
         description: Live address of the app, if it has one
         type: string
         default: ""
+      ai:
+        description: anthropic, gemini, openai, another provider name from LiteLLM, or the address of a service that accepts Anthropic-format requests
+        type: string
+        default: anthropic
+      model:
+        description: Model name at that service. Empty uses Anthropic's default.
+        type: string
+        default: ""
       setup:
-        description: Commands that prepare the project so its checks can run. Empty installs from the lockfile.
+        description: Commands that prepare the project so its checks can run. Empty installs from the usual files (lockfiles, requirements.txt, go.mod and so on).
         type: string
         default: ""
       node-version:
+        description: Node.js version for JavaScript projects. Empty means the latest LTS.
         type: string
-        default: "24"
+        default: ""
       production-environment:
         description: Deployment environment that counts as production
         type: string
@@ -23,12 +32,9 @@ on:
         type: string
         default: ""
       tools:
-        description: Commands Orbis may run, in Claude Code's allowed-tools format
+        description: Commands Orbis may run, for example Bash(pytest:*)
         type: string
-        default: Bash(pnpm:*),Bash(npm run:*),Bash(npm test:*),Bash(npm ci:*),Bash(npm install:*),Bash(yarn:*)
-      model:
-        type: string
-        default: claude-sonnet-5-5
+        default: Bash(npm run:*),Bash(npm test:*),Bash(npm ci:*),Bash(npm install:*),Bash(pnpm:*),Bash(yarn:*),Bash(bun:*),Bash(pip install:*),Bash(python -m:*),Bash(python3 -m:*),Bash(pytest:*),Bash(uv:*),Bash(poetry:*),Bash(ruff:*),Bash(mypy:*),Bash(go:*),Bash(cargo:*),Bash(bundle:*),Bash(rake:*),Bash(composer:*),Bash(vendor/bin/*),Bash(mvn:*),Bash(./mvnw:*),Bash(gradle:*),Bash(./gradlew:*),Bash(dotnet:*),Bash(make:*)
       max-open-prs:
         description: The weekly check-up skips while this many Orbis PRs wait for review
         type: number
@@ -41,9 +47,13 @@ on:
         type: string
         default: orbis.yml
     secrets:
-      CLAUDE_CODE_OAUTH_TOKEN:
+      AI_API_KEY:
         required: false
-      ANTHROPIC_API_KEY:
+      AI_PLAN_TOKEN:
+        required: false
+      ORBIS_APP_CLIENT_ID:
+        required: false
+      ORBIS_APP_PRIVATE_KEY:
         required: false
       TELEGRAM_BOT_TOKEN:
         required: false
@@ -51,9 +61,11 @@ on:
         required: false
 
 env:
+  HAS_AI: ${{ secrets.AI_API_KEY != '' || secrets.AI_PLAN_TOKEN != '' }}
+  HAS_APP: ${{ secrets.ORBIS_APP_CLIENT_ID != '' && secrets.ORBIS_APP_PRIVATE_KEY != '' }}
   ORBIS_RULES: |
     You are Orbis, an agent that looks after this repository for its owner.
-    - Read CLAUDE.md first if it exists and follow it. If there isn't one, work out the project's checks from its files (package.json scripts, Makefile, README).
+    - Read AGENTS.md (or CLAUDE.md) first if the repository has one and follow it. If it has neither, work out the project's checks from its files (package.json, pyproject.toml, go.mod, Cargo.toml, Makefile, README).
     - Work on a new branch named orbis/<topic>. Never push to the default branch, merge anything, or close the owner's PRs.
     - One topic per PR, small enough to review on a phone. Write PRs for the owner, not for an engineer: plain words, short.
     - When fixing a bug, first write a test that fails because of it, then fix the code until the test passes.
@@ -113,7 +125,6 @@ jobs:
           TITLE: ${{ github.event.inputs.title }}
           DETAILS: ${{ github.event.inputs.details }}
           LIMIT: ${{ inputs.max-incidents-per-day }}
-          HAS_AI: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -156,25 +167,118 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
-      - if: hashFiles('pnpm-lock.yaml') != ''
+      - &pnpm
+        if: hashFiles('pnpm-lock.yaml') != ''
         uses: pnpm/action-setup@v6
-      - if: hashFiles('package.json') != ''
+      - &node
+        if: hashFiles('package.json') != ''
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ inputs.node-version }}
-      - env:
+          node-version: ${{ inputs.node-version || 'lts/*' }}
+      - &bun
+        if: hashFiles('bun.lock', 'bun.lockb') != ''
+        uses: oven-sh/setup-bun@v2
+      - &python
+        if: hashFiles('requirements.txt', 'pyproject.toml', 'Pipfile', 'uv.lock', 'poetry.lock') != ''
+        uses: actions/setup-python@v7
+      - &uv
+        if: hashFiles('uv.lock') != ''
+        uses: astral-sh/setup-uv@v10
+      - &go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - &ruby
+        if: hashFiles('Gemfile') != ''
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ hashFiles('.ruby-version', '.tool-versions') != '' && 'default' || 'ruby' }}
+          bundler-cache: true
+      - &install
+        name: Install the project
+        env:
           SETUP: ${{ inputs.setup }}
         run: |
-          if [ -n "$SETUP" ]; then bash -ec "$SETUP"
-          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci
-          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          try() { "$@" || echo "::warning::\"$*\" failed. Orbis will run into the same problem when it runs the checks."; }
+          if [ -n "$SETUP" ]; then try bash -ec "$SETUP"; exit 0; fi
+          if [ -f pnpm-lock.yaml ]; then try pnpm install --frozen-lockfile
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then try bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then try npm ci
+          elif [ -f yarn.lock ]; then try yarn install --frozen-lockfile
           fi
-      - id: claude
+          if [ -f uv.lock ]; then try uv sync --frozen
+          elif [ -f poetry.lock ]; then try pipx install poetry && try poetry install
+          elif [ -f requirements.txt ]; then try pip install -r requirements.txt
+          fi
+          if [ -f go.mod ]; then try go mod download; fi
+          if [ -f Cargo.toml ]; then try cargo fetch; fi
+          if [ -f composer.json ]; then try composer install --no-interaction; fi
+      - &connect
+        name: Connect to the AI
+        env:
+          AI: ${{ inputs.ai }}
+          MODEL: ${{ inputs.model }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+        run: |
+          [ "$AI" != anthropic ] || exit 0
+          if [ -z "$MODEL" ]; then
+            echo "::error::Orbis uses \"$AI\", so set the model setting to a model name from that service."
+            exit 1
+          fi
+          url=$AI
+          case "$AI" in
+            http://* | https://*) ;;
+            *)
+              /usr/bin/python3 -m venv "$RUNNER_TEMP/translator"
+              "$RUNNER_TEMP/translator/bin/pip" install --quiet "litellm[proxy]==1.106.2"
+              printf 'model_list:\n  - model_name: "*"\n    litellm_params:\n      model: "%s/%s"\n      api_key: os.environ/AI_API_KEY\nlitellm_settings:\n  num_retries: 5\n' \
+                "$AI" "$MODEL" > "$RUNNER_TEMP/translator.yaml"
+              nohup "$RUNNER_TEMP/translator/bin/litellm" --config "$RUNNER_TEMP/translator.yaml" --host 127.0.0.1 --port 4000 \
+                > "$RUNNER_TEMP/translator.log" 2>&1 &
+              for _ in $(seq 60); do curl -fs -o /dev/null http://127.0.0.1:4000/health/liveliness && break; sleep 2; done
+              if ! curl -fs -o /dev/null http://127.0.0.1:4000/health/liveliness; then
+                cat "$RUNNER_TEMP/translator.log"
+                echo "::error::The translator for \"$AI\" didn't start."
+                exit 1
+              fi
+              url=http://127.0.0.1:4000
+              ;;
+          esac
+          {
+            echo "ANTHROPIC_BASE_URL=$url"
+            echo "ANTHROPIC_AUTH_TOKEN=$AI_API_KEY"
+            echo "ANTHROPIC_DEFAULT_OPUS_MODEL=$MODEL"
+            echo "ANTHROPIC_DEFAULT_SONNET_MODEL=$MODEL"
+            echo "ANTHROPIC_DEFAULT_HAIKU_MODEL=$MODEL"
+            echo "CLAUDE_CODE_SUBAGENT_MODEL=$MODEL"
+            echo "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+          } >> "$GITHUB_ENV"
+      - &app
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.ORBIS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ORBIS_APP_PRIVATE_KEY }}
+      - &bot
+        id: bot
+        if: env.HAS_APP == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          id=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API_URL/users/$SLUG%5Bbot%5D" | jq -r .id)
+          { echo "name=$SLUG[bot]"; echo "id=$id"; } >> "$GITHUB_OUTPUT"
+      - id: agent
+        name: Run Orbis
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ inputs.ai == 'anthropic' && secrets.AI_PLAN_TOKEN || '' }}
+          anthropic_api_key: ${{ (inputs.ai != 'anthropic' || secrets.AI_PLAN_TOKEN == '') && secrets.AI_API_KEY || '' }}
+          github_token: ${{ steps.app.outputs.token }}
+          bot_name: ${{ steps.bot.outputs.name || 'claude[bot]' }}
+          bot_id: ${{ steps.bot.outputs.id || '41898282' }}
           allowed_bots: github-actions
           additional_permissions: |
             actions: read
@@ -199,14 +303,14 @@ jobs:
 
             Finish with outcome "pr" (and pr_url) if you opened a PR, otherwise "comment", and a summary of one or two plain sentences for the owner.
           claude_args: |
-            --model ${{ inputs.model }}
+            ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
             --max-turns 50
             --allowedTools "Edit,Write,${{ inputs.tools }},Bash(git:*),Bash(curl:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr create:*),Bash(gh issue view:*),Bash(gh issue comment:*)"
             --disallowedTools "Edit(.github/**),Write(.github/**)"
             --json-schema '{"type":"object","properties":{"outcome":{"type":"string","enum":["pr","comment"]},"summary":{"type":"string"},"pr_url":{"type":"string"}},"required":["outcome","summary"]}'
       - if: always()
         env:
-          OUT: ${{ steps.claude.outputs.structured_output }}
+          OUT: ${{ steps.agent.outputs.structured_output }}
           TITLE: ${{ github.event.inputs.title }}
           ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ needs.triage.outputs.issue }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -243,7 +347,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           LIMIT: ${{ inputs.max-open-prs }}
-          HAS_AI: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
         run: |
           gh label create orbis --color 5319E7 --description "Opened by Orbis" --force
           waiting=$(gh pr list --label orbis --state open --json number --jq length)
@@ -267,30 +370,31 @@ jobs:
       id-token: write
       actions: read
     outputs:
-      result: ${{ steps.claude.outputs.structured_output }}
+      result: ${{ steps.agent.outputs.structured_output }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - if: hashFiles('pnpm-lock.yaml') != ''
-        uses: pnpm/action-setup@v6
-      - if: hashFiles('package.json') != ''
-        uses: actions/setup-node@v7
-        with:
-          node-version: ${{ inputs.node-version }}
-      - env:
-          SETUP: ${{ inputs.setup }}
-        run: |
-          if [ -n "$SETUP" ]; then bash -ec "$SETUP"
-          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci
-          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
-          fi
-      - id: claude
+      - *pnpm
+      - *node
+      - *bun
+      - *python
+      - *uv
+      - *go
+      - *ruby
+      - *install
+      - *connect
+      - *app
+      - *bot
+      - id: agent
+        name: Run Orbis
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ inputs.ai == 'anthropic' && secrets.AI_PLAN_TOKEN || '' }}
+          anthropic_api_key: ${{ (inputs.ai != 'anthropic' || secrets.AI_PLAN_TOKEN == '') && secrets.AI_API_KEY || '' }}
+          github_token: ${{ steps.app.outputs.token }}
+          bot_name: ${{ steps.bot.outputs.name || 'claude[bot]' }}
+          bot_id: ${{ steps.bot.outputs.id || '41898282' }}
           additional_permissions: |
             actions: read
           prompt: |
@@ -313,7 +417,7 @@ jobs:
 
             Finish with outcome "pr" (and pr_url) or "nothing", and a summary of one plain sentence for the owner's weekly report.
           claude_args: |
-            --model ${{ inputs.model }}
+            ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
             --max-turns 60
             --allowedTools "Edit,Write,${{ inputs.tools }},Bash(git:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr create:*),Bash(gh issue list:*),Bash(gh issue view:*)"
             --disallowedTools "Edit(.github/**),Write(.github/**)"
@@ -373,30 +477,32 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v7
-      - if: hashFiles('pnpm-lock.yaml') != ''
-        uses: pnpm/action-setup@v6
-      - if: hashFiles('package.json') != ''
-        uses: actions/setup-node@v7
+      - *pnpm
+      - *node
+      - *bun
+      - *python
+      - *uv
+      - *go
+      - *ruby
+      - *install
+      - *connect
+      - *app
+      - *bot
+      - name: Run Orbis
+        uses: anthropics/claude-code-action@v1
         with:
-          node-version: ${{ inputs.node-version }}
-      - env:
-          SETUP: ${{ inputs.setup }}
-        run: |
-          if [ -n "$SETUP" ]; then bash -ec "$SETUP"
-          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci
-          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
-          fi
-      - uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ inputs.ai == 'anthropic' && secrets.AI_PLAN_TOKEN || '' }}
+          anthropic_api_key: ${{ (inputs.ai != 'anthropic' || secrets.AI_PLAN_TOKEN == '') && secrets.AI_API_KEY || '' }}
+          github_token: ${{ steps.app.outputs.token }}
+          bot_name: ${{ steps.bot.outputs.name || 'claude[bot]' }}
+          bot_id: ${{ steps.bot.outputs.id || '41898282' }}
           trigger_phrase: "@orbis"
-          include_comments_by_actor: ${{ inputs.reviewer || github.repository_owner }},claude[bot]
+          include_comments_by_actor: ${{ inputs.reviewer || github.repository_owner }},${{ steps.bot.outputs.name || 'claude[bot]' }}
+          classify_inline_comments: "false"
           additional_permissions: |
             actions: read
           claude_args: |
-            --model ${{ inputs.model }}
+            ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
             --max-turns 40
             --append-system-prompt "${{ env.ORBIS_RULES }}"
             --allowedTools "Edit,Write,${{ inputs.tools }},Bash(git:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Bash(gh run view:*),Bash(gh issue view:*)"

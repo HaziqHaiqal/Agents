@@ -1,0 +1,33 @@
+name: Orbis test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ai:
+        description: AI service to test
+        default: gemini
+      model:
+        description: Model name at that service
+        default: gemini-3.6-flash
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: write
+
+jobs:
+  checkup:
+    uses: ./.github/workflows/orbis.yml
+    with:
+      ai: ${{ inputs.ai }}
+      model: ${{ inputs.model }}
+      workflow-file: orbis-test.yml
+    secrets:
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
+      AI_PLAN_TOKEN: ${{ secrets.AI_PLAN_TOKEN }}
+      ORBIS_APP_CLIENT_ID: ${{ secrets.ORBIS_APP_CLIENT_ID }}
+      ORBIS_APP_PRIVATE_KEY: ${{ secrets.ORBIS_APP_PRIVATE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

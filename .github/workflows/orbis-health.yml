@@ -11,6 +11,10 @@ on:
         description: Pages to check, separated by spaces. A page is down when it answers with a server error or not at all.
         type: string
         default: /
+      rollback-command:
+        description: Command that puts the previous version live on your host. It runs once when an outage starts, with the DEPLOY_TOKEN secret in $DEPLOY_TOKEN. Not needed on Vercel.
+        type: string
+        default: ""
       rollback-max-age-minutes:
         description: Roll back on Vercel only when the live version is younger than this
         type: number
@@ -20,6 +24,8 @@ on:
         type: string
         default: orbis.yml
     secrets:
+      DEPLOY_TOKEN:
+        required: false
       VERCEL_TOKEN:
         required: false
       VERCEL_ORG_ID:
@@ -56,7 +62,7 @@ jobs:
       SITE: ${{ inputs.site }}
       PATHS: ${{ inputs.paths }}
       REHEARSE: ${{ github.event.inputs.rehearse == 'true' }}
-      CAN_ROLL_BACK: ${{ secrets.VERCEL_TOKEN != '' }}
+      CAN_ROLL_BACK: ${{ secrets.VERCEL_TOKEN != '' || inputs.rollback-command != '' }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -83,7 +89,8 @@ jobs:
       - id: open
         run: |
           found=$(gh issue list --label incident --state open --json number,title,createdAt,body \
-            --jq '[.[] | select(.title == "Site down")][0] // empty | "\(.number) \(.createdAt) \(.body | test("Rolled back"))"')
+            --jq '[.[] | select(.title == "Site down")][0] // empty
+              | "\(.number) \(.createdAt) \(if (.body | test("Rolled back on Vercel")) then "vercel" elif (.body | test("Rolled back with the rollback command")) then "command" else "no" end)"')
           if [ -n "$found" ]; then
             read -r number created rolled <<<"$found"
             { echo "number=$number"; echo "created=$created"; echo "rolled=$rolled"; } >> "$GITHUB_OUTPUT"
@@ -96,10 +103,22 @@ jobs:
         continue-on-error: true
         env:
           MAX_AGE: ${{ inputs.rollback-max-age-minutes }}
+          ROLLBACK_COMMAND: ${{ inputs.rollback-command }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            if [ "$REHEARSE" = true ]; then
+              result="Rehearsal only: this would run the rollback command."
+            else
+              bash -ec "$ROLLBACK_COMMAND"
+              result="Rolled back with the rollback command."
+            fi
+            echo "result=$result" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           api() { curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com$1"; }
           case "$VERCEL_ORG_ID" in team_*) team="teamId=$VERCEL_ORG_ID" ;; *) team="" ;; esac
           host=${SITE#*://}
@@ -118,7 +137,7 @@ jobs:
               result="Rehearsal only: this would roll back to https://$previous, because the live version is $minutes minutes old."
             else
               npx --yes vercel@65.11.0 rollback "https://$previous" --token "$VERCEL_TOKEN" --timeout 3m
-              result="Rolled back to the previous version (https://$previous), because the live version was only $minutes minutes old. New releases stay paused until you press Undo Rollback in Vercel."
+              result="Rolled back on Vercel to the previous version (https://$previous), because the live version was only $minutes minutes old. New releases stay paused until you press Undo Rollback in Vercel."
             fi
           fi
           echo "result=$result" >> "$GITHUB_OUTPUT"
@@ -134,11 +153,11 @@ jobs:
         run: |
           eval "$TELL"
           if [ "$ROLLBACK_OUTCOME" = failure ]; then
-            rollback="The automatic rollback failed (see $RUN_URL). Roll back in Vercel by hand if the site is still down."
+            rollback="The automatic rollback failed (see $RUN_URL). Roll back at your host by hand if the site is still down."
           elif [ -n "$ROLLBACK" ]; then
             rollback=$ROLLBACK
           else
-            rollback="Automatic rollback is off until the VERCEL_TOKEN, VERCEL_ORG_ID and VERCEL_PROJECT_ID secrets are added."
+            rollback="Automatic rollback is off. To turn it on, add the Vercel secrets or a rollback-command (see the Orbis README)."
           fi
           details=$(printf 'The health check could not reach %s at %s UTC. %s\n\n%s' "$SITE" "$(date -u '+%d %b %H:%M')" "$DETAIL" "$rollback")
           if [ "$REHEARSE" = true ]; then
@@ -159,8 +178,10 @@ jobs:
           eval "$TELL"
           minutes=$(( ($(date +%s) - $(date -d "$CREATED" +%s)) / 60 ))
           note="Back up at $(date -u '+%d %b %H:%M') UTC, about $minutes minutes after this issue was opened."
-          if [ "$ROLLED" = true ]; then
+          if [ "$ROLLED" = vercel ]; then
             note="$note Orbis rolled back to the previous version, so new releases stay paused. Press Undo Rollback in Vercel once the fix is merged."
+          elif [ "$ROLLED" = command ]; then
+            note="$note Orbis ran the rollback command, so the previous version is live. Release again once the fix is merged."
           fi
           gh issue close "$NUMBER" --comment "$note"
           tell "$(printf '✅ %s is back up\n\n%s' "${GITHUB_REPOSITORY#*/}" "$note")" "Open issue" "$ISSUE_URL"
