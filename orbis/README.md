@@ -37,7 +37,7 @@ Other services work too:
 - **Services that accept Anthropic-format requests**, such as Kimi, GLM and Ollama's cloud. If their docs give an `ANTHROPIC_BASE_URL`, put that address in `ai`.
 - **Everything else** goes through LiteLLM, a translator Orbis starts inside each run. Use its provider name as `ai`, as with `gemini` and `openai` above. Others include `mistral`, `groq` and `xai`; see the [list of providers](https://docs.litellm.ai/docs/providers).
 
-Orbis is tested with Anthropic and Gemini. Other services usually work, but smaller models often struggle with long, multi-step work like finding a bug, testing it and opening a PR. When a run fails, Orbis reports that it couldn't finish, and nothing else is affected.
+Orbis is run with Anthropic. The other services connect the standard way but haven't been tried in a real run yet; the **Orbis test** workflow in this repo is there for that. Smaller models often struggle with long, multi-step work like finding a bug, testing it and opening a PR. When a run fails, Orbis reports that it couldn't finish, and nothing else is affected.
 
 ### 3. Let it open PRs
 
